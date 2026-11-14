@@ -1891,6 +1891,222 @@ async def _list_group_systems(group_name: str, token: str) -> List[Dict[str, str
                 logger.warning(msg)
     return filtered_systems
 
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+async def list_ansible_control_nodes(ctx: Context) -> List[Dict[str, Any]]:
+    """List Ansible control nodes with their playbook and inventory paths.
+
+    Use this first for any question about Ansible playbooks or inventories.
+    Inputs: none.
+    Returns: list of `system_id`, `system_name`, `playbook_paths` and `inventory_paths` (each path has `path_id` and `path`).
+    Note: pass a `path_id` to `list_ansible_playbooks` or `get_ansible_inventory`; those two tools are
+    available only when write tools are enabled.
+    """
+    log_string = "Listing Ansible control nodes"
+    logger.info(log_string)
+    await ctx.info(log_string)
+
+    token = await extract_token(ctx)
+    return await _list_ansible_control_nodes(token)
+
+async def _list_ansible_control_nodes(token: str) -> List[Dict[str, Any]]:
+    control_nodes: List[Dict[str, Any]] = []
+
+    async with _make_client() as client:
+        await uyuni_login(client, token=token)
+
+        systems = await call_uyuni_api(
+            client=client,
+            method="GET",
+            api_path="/rhn/manager/api/system/listSystemsWithEntitlement",
+            params={"entitlementName": "ansible_control_node"},
+            error_context="listing Ansible control nodes",
+            token=token,
+            perform_login=False
+        )
+        if not isinstance(systems, list):
+            logger.warning(f"Expected a list of control nodes, but received: {type(systems)}")
+            return control_nodes
+
+        for system in systems:
+            if not isinstance(system, dict) or system.get('id') is None:
+                logger.warning(f"Unexpected item format in control node list: {system}")
+                continue
+            paths = await call_uyuni_api(
+                client=client,
+                method="GET",
+                api_path="/rhn/manager/api/ansible/listAnsiblePaths",
+                params={"controlNodeId": system['id']},
+                error_context=f"listing Ansible paths of control node {system['id']}",
+                token=token,
+                perform_login=False
+            )
+            node: Dict[str, Any] = {
+                'system_id': str(system['id']),
+                'system_name': system.get('name'),
+                'playbook_paths': [],
+                'inventory_paths': [],
+            }
+            if not isinstance(paths, list):
+                logger.warning(f"Expected a list of Ansible paths for control node {system['id']}, but received: {type(paths)}")
+                paths = []
+            for path in paths:
+                if not isinstance(path, dict) or path.get('id') is None:
+                    logger.warning(f"Unexpected item format in Ansible path list: {path}")
+                    continue
+                key = {'playbook': 'playbook_paths', 'inventory': 'inventory_paths'}.get(path.get('type', ''))
+                if key:
+                    node[key].append({'path_id': str(path['id']), 'path': path.get('path')})
+            control_nodes.append(node)
+
+    return control_nodes
+
+@write_tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+async def list_ansible_playbooks(path_id: int, ctx: Context, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    """List the playbooks found under a playbook path of an Ansible control node.
+
+    This tool only reads: it changes nothing on the server or the control node and runs no playbook. It needs
+    write tools enabled because the Uyuni API exposes this call only as POST.
+
+    Inputs: `path_id` of a playbook path (from `list_ansible_control_nodes`); optional `limit`, `offset`.
+    `limit` is capped at 500.
+    Returns: `path_id`, `items` with `playbook` (relative path), `full_path` and `inventory` (the playbook's own
+    inventory, or empty), and `meta`.
+    """
+    log_string = f"Listing Ansible playbooks in path {path_id}"
+    logger.info(log_string)
+    await ctx.info(log_string)
+
+    token = await extract_token(ctx)
+    playbooks = await _list_ansible_playbooks(path_id, token)
+    normalized_limit, normalized_offset = normalize_pagination(limit=limit, offset=offset, default_limit=50, max_limit=500)
+    paged_items, meta = paginate_items(playbooks, limit=normalized_limit, offset=normalized_offset)
+    return {'path_id': str(path_id), 'items': paged_items, 'meta': meta}
+
+async def _list_ansible_playbooks(path_id: int, token: str) -> List[Dict[str, str]]:
+    async with _make_client() as client:
+        api_result = await call_uyuni_api(
+            client=client,
+            method="POST",
+            api_path="/rhn/manager/api/ansible/discoverPlaybooks",
+            json_body={"pathId": int(path_id)},
+            error_context=f"listing playbooks in Ansible path {path_id}",
+            token=token
+        )
+
+    playbooks: List[Dict[str, str]] = []
+    if not isinstance(api_result, dict):
+        logger.warning(f"Expected a dict of discovered playbooks, but received: {type(api_result)}")
+        return playbooks
+    for found in api_result.values():
+        if not isinstance(found, dict):
+            logger.warning(f"Unexpected item format in discovered playbooks: {found}")
+            continue
+        for name, info in found.items():
+            if not isinstance(info, dict):
+                logger.warning(f"Unexpected details for playbook {name}: {info}")
+                info = {}
+            playbooks.append({
+                'playbook': name,
+                'full_path': info.get('fullpath', ''),
+                'inventory': info.get('custom_inventory') or '',
+            })
+    # Sorted, so that paging with `offset` stays stable across calls.
+    return sorted(playbooks, key=lambda playbook: playbook['full_path'] or playbook['playbook'])
+
+# Not read-only: the control node executes the inventory, which can be a script.
+@write_tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def get_ansible_inventory(path_id: int, ctx: Context, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    """Show the groups and hosts of an inventory path of an Ansible control node.
+
+    These are Ansible inventory groups, not system groups; for system groups use `list_group_systems`.
+    This tool does not change the server, but the control node runs `ansible-inventory` on this path as root, so a
+    dynamic inventory script or plugin at that path executes there with root privileges. The user must confirm: a
+    client that cannot ask for a confirmation gets a refusal and nothing is run. It needs write tools enabled
+    because the Uyuni API exposes this call only as POST.
+
+    Inputs: `path_id` of an inventory path (from `list_ansible_control_nodes`); optional `limit`, `offset` for the hosts.
+    `limit` is capped at 500.
+    Returns: `path_id`, `path`, `system_id` of the control node, `groups` (each group name with its `children`
+    and `host_count`), `items` with `host` and the `groups` it is a direct member of, and `meta`.
+    If the user declines or the path is not an inventory path, `message` says why and nothing is listed.
+    Note: host and group variables are not returned.
+    """
+    log_string = f"Reading Ansible inventory in path {path_id}"
+    logger.info(log_string)
+    await ctx.info(log_string)
+
+    token = await extract_token(ctx)
+    result = await _get_ansible_inventory(path_id, token, ctx)
+    normalized_limit, normalized_offset = normalize_pagination(limit=limit, offset=offset, default_limit=50, max_limit=500)
+    result['items'], result['meta'] = paginate_items(result.pop('hosts'), limit=normalized_limit, offset=normalized_offset)
+    return result
+
+async def _get_ansible_inventory(path_id: int, token: str, ctx: Context) -> Dict[str, Any]:
+    result: Dict[str, Any] = {'path_id': str(path_id), 'groups': {}, 'hosts': []}
+
+    async with _make_client() as client:
+        await uyuni_login(client, token=token)
+
+        # Look the path up first, so the user confirms a path and a system rather than a number.
+        path = await call_uyuni_api(
+            client=client,
+            method="GET",
+            api_path="/rhn/manager/api/ansible/lookupAnsiblePathById",
+            params={"pathId": int(path_id)},
+            error_context=f"looking up Ansible path {path_id}",
+            token=token,
+            perform_login=False
+        )
+        if isinstance(path, dict):
+            result['path'] = path.get('path')
+            if path.get('server_id') is not None:
+                result['system_id'] = str(path['server_id'])
+        if not isinstance(path, dict) or path.get('type') != 'inventory':
+            result['message'] = f"Path {path_id} is not an inventory path. Nothing was run."
+            return result
+
+        # Running an inventory executes code on the control node, so a client that cannot ask is refused.
+        if not client_supports_elicitation(ctx):
+            result['message'] = ("This client cannot ask for a confirmation, and the control node runs an "
+                                 "inventory only after one. Nothing was run.")
+            return result
+        if not await elicit_approval(
+            ctx,
+            f"This will make control node {result.get('system_id', 'unknown')} run `ansible-inventory` as root on "
+            f"{result.get('path')} (path {path_id}). A dynamic inventory script or plugin there is executed. Continue?",
+        ):
+            result['message'] = "Operation cancelled."
+            return result
+
+        api_result = await call_uyuni_api(
+            client=client,
+            method="POST",
+            api_path="/rhn/manager/api/ansible/introspectInventory",
+            json_body={"pathId": int(path_id)},
+            error_context=f"reading Ansible inventory path {path_id}",
+            token=token,
+            perform_login=False
+        )
+
+    # Keep only the structure: `_meta.hostvars` and group `vars` can hold secrets.
+    members: Dict[str, List[str]] = {}
+    if not isinstance(api_result, dict):
+        logger.warning(f"Expected a dict for Ansible inventory {path_id}, but received: {type(api_result)}")
+        result['message'] = f"Unexpected response from {product} for inventory path {path_id}. Nothing was listed."
+        return result
+    for name, group in api_result.items():
+        if name == '_meta':
+            continue
+        if not isinstance(group, dict):
+            logger.warning(f"Unexpected item format for inventory group {name}: {group}")
+            continue
+        hosts = [str(host) for host in group.get('hosts') or []]
+        result['groups'][name] = {'children': list(group.get('children') or []), 'host_count': len(hosts)}
+        for host in hosts:
+            members.setdefault(host, []).append(name)
+    result['hosts'] = [{'host': host, 'groups': groups} for host, groups in sorted(members.items())]
+    return result
+
 @write_tool()
 async def add_systems_to_group(group_name: str, system_identifiers: List[str], ctx: Context) -> str:
     """Add systems to a group.

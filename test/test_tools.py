@@ -1072,3 +1072,451 @@ def test_get_public_base_url_rewrites_wildcard_bind_host():
     }
 
     assert server._get_public_base_url(config) == "http://127.0.0.1:8000"
+
+@pytest.mark.asyncio
+async def test_list_ansible_control_nodes_logs_in_once(mock_uyuni):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    login_route = mock_uyuni.post(f"{base_url}/rhn/manager/api/oidcLogin")
+    systems_route = mock_uyuni.get(f"{base_url}/rhn/manager/api/system/listSystemsWithEntitlement").mock(
+        return_value=Response(200, json={"success": True, "result": [
+            {"id": 1001, "name": "cn1.example.com"},
+            {"id": 1002, "name": "cn2.example.com"},
+        ]})
+    )
+    paths_route = mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/listAnsiblePaths").mock(
+        side_effect=[
+            Response(200, json={"success": True, "result": [
+                {"id": 5, "type": "playbook", "server_id": 1001, "path": "/srv/playbooks"},
+                {"id": 6, "type": "inventory", "server_id": 1001, "path": "/etc/ansible/hosts"},
+            ]}),
+            Response(200, json={"success": True, "result": []}),
+        ]
+    )
+
+    result = await server._list_ansible_control_nodes("mock_token")
+
+    assert result == [
+        {
+            'system_id': "1001",
+            'system_name': "cn1.example.com",
+            'playbook_paths': [{'path_id': "5", 'path': "/srv/playbooks"}],
+            'inventory_paths': [{'path_id': "6", 'path': "/etc/ansible/hosts"}],
+        },
+        {
+            'system_id': "1002",
+            'system_name': "cn2.example.com",
+            'playbook_paths': [],
+            'inventory_paths': [],
+        },
+    ]
+    assert systems_route.calls.last.request.url.params["entitlementName"] == "ansible_control_node"
+    assert [c.request.url.params["controlNodeId"] for c in paths_route.calls] == ["1001", "1002"]
+    assert login_route.call_count == 1
+
+@pytest.mark.asyncio
+async def test_list_ansible_control_nodes_none(mock_uyuni):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/system/listSystemsWithEntitlement").mock(
+        return_value=Response(200, json={"success": True, "result": []})
+    )
+
+    assert await server._list_ansible_control_nodes("mock_token") == []
+
+@pytest.mark.asyncio
+async def test_list_ansible_playbooks(mock_uyuni):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    route = mock_uyuni.post(f"{base_url}/rhn/manager/api/ansible/discoverPlaybooks").mock(
+        return_value=Response(200, json={"success": True, "result": {
+            "/etc/ansible/playbooks": {
+                "site/facts.yml": {"fullpath": "/etc/ansible/playbooks/site/facts.yml"},
+                "lamp/site.yml": {"fullpath": "/etc/ansible/playbooks/lamp/site.yml", "custom_inventory": "/etc/ansible/playbooks/lamp/hosts"},
+            }
+        }})
+    )
+
+    result = await server._list_ansible_playbooks(5, "mock_token")
+
+    # sorted by full path, whatever order the API returns
+    assert result == [
+        {'playbook': "lamp/site.yml", 'full_path': "/etc/ansible/playbooks/lamp/site.yml", 'inventory': "/etc/ansible/playbooks/lamp/hosts"},
+        {'playbook': "site/facts.yml", 'full_path': "/etc/ansible/playbooks/site/facts.yml", 'inventory': ""},
+    ]
+    assert json.loads(route.calls.last.request.content) == {"pathId": 5}
+
+def _says_yes(mock_ctx):
+    """A client that can ask and whose user confirms."""
+    mock_ctx.session.check_client_capability.return_value = True
+    mock_ctx.elicit = AsyncMock(return_value=MagicMock(action="accept", data={"approve": True}))
+    return mock_ctx
+
+def _mock_inventory_path(mock_uyuni):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    lookup_route = mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/lookupAnsiblePathById").mock(
+        return_value=Response(200, json={"success": True, "result": {
+            "id": 6, "type": "inventory", "server_id": 1001, "path": "/etc/ansible/hosts",
+        }})
+    )
+    inventory_route = mock_uyuni.post(f"{base_url}/rhn/manager/api/ansible/introspectInventory").mock(
+        return_value=Response(200, json={"success": True, "result": {
+            "_meta": {
+                "hostvars": {"leap.example.com": {"ansible_user": "root", "db_password": "secret"}},
+                "profile": "inventory_legacy",
+            },
+            "all": {"children": ["ungrouped", "site"]},
+            "site": {"children": ["web", "db"]},
+            "web": {"hosts": ["leap.example.com", "alma.example.com"], "vars": {"api_token": "secret"}},
+            "db": {"hosts": ["leap.example.com"]},
+        }})
+    )
+    return lookup_route, inventory_route
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_drops_variables(mock_uyuni, mock_ctx):
+    login_route = mock_uyuni.post(f"{server.CONFIG['UYUNI_SERVER']}/rhn/manager/api/oidcLogin")
+    lookup_route, inventory_route = _mock_inventory_path(mock_uyuni)
+
+    result = await server._get_ansible_inventory(6, "mock_token", _says_yes(mock_ctx))
+
+    assert result == {
+        'path_id': "6",
+        'path': "/etc/ansible/hosts",
+        'system_id': "1001",
+        'groups': {
+            'all': {'children': ["ungrouped", "site"], 'host_count': 0},
+            'site': {'children': ["web", "db"], 'host_count': 0},
+            'web': {'children': [], 'host_count': 2},
+            'db': {'children': [], 'host_count': 1},
+        },
+        'hosts': [
+            {'host': "alma.example.com", 'groups': ["web"]},
+            {'host': "leap.example.com", 'groups': ["web", "db"]},
+        ],
+    }
+    assert "secret" not in json.dumps(result)
+    assert lookup_route.calls.last.request.url.params["pathId"] == "6"
+    assert json.loads(inventory_route.calls.last.request.content) == {"pathId": 6}
+    assert login_route.call_count == 1
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elicit_result,executed", [
+    (MagicMock(action="accept", data={"approve": True}), True),
+    (MagicMock(action="accept", data={"approve": False}), False),
+    (MagicMock(action="decline", data=None), False),
+    (MagicMock(action="cancel", data=None), False),
+])
+async def test_get_ansible_inventory_asks_before_running(mock_uyuni, mock_ctx, elicit_result, executed):
+    _, inventory_route = _mock_inventory_path(mock_uyuni)
+    mock_ctx.session.check_client_capability.return_value = True
+    mock_ctx.elicit = AsyncMock(return_value=elicit_result)
+
+    result = await server._get_ansible_inventory(6, "mock_token", mock_ctx)
+
+    prompt = mock_ctx.elicit.call_args.args[0]
+    assert "as root" in prompt and "/etc/ansible/hosts" in prompt and "1001" in prompt
+    assert inventory_route.called is executed
+    if executed:
+        assert len(result['hosts']) == 2
+        assert 'message' not in result
+    else:
+        assert result == {
+            'path_id': "6", 'path': "/etc/ansible/hosts", 'system_id': "1001",
+            'groups': {}, 'hosts': [], 'message': "Operation cancelled.",
+        }
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_refuses_a_client_that_cannot_ask(mock_uyuni, mock_ctx):
+    _, inventory_route = _mock_inventory_path(mock_uyuni)
+    mock_ctx.session.check_client_capability.return_value = False
+    mock_ctx.elicit = AsyncMock()
+
+    result = await server._get_ansible_inventory(6, "mock_token", mock_ctx)
+
+    assert "cannot ask for a confirmation" in result['message'] and "Nothing was run" in result['message']
+    assert result['hosts'] == [] and result['groups'] == {}
+    mock_ctx.elicit.assert_not_called()
+    assert not inventory_route.called
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_refuses_playbook_path(mock_uyuni, mock_ctx):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/lookupAnsiblePathById").mock(
+        return_value=Response(200, json={"success": True, "result": {
+            "id": 5, "type": "playbook", "server_id": 1001, "path": "/srv/playbooks",
+        }})
+    )
+    inventory_route = mock_uyuni.post(f"{base_url}/rhn/manager/api/ansible/introspectInventory")
+    mock_ctx.session.check_client_capability.return_value = True
+    mock_ctx.elicit = AsyncMock()
+
+    result = await server._get_ansible_inventory(5, "mock_token", mock_ctx)
+
+    assert result == {
+        'path_id': "5", 'path': "/srv/playbooks", 'system_id': "1001",
+        'groups': {}, 'hosts': [], 'message': "Path 5 is not an inventory path. Nothing was run.",
+    }
+    mock_ctx.elicit.assert_not_called()
+    assert not inventory_route.called
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_unknown_path_runs_nothing(mock_uyuni, mock_ctx):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/lookupAnsiblePathById").mock(
+        return_value=Response(200, json={"success": False, "message": "Unable to find ansible path id: 99"})
+    )
+    inventory_route = mock_uyuni.post(f"{base_url}/rhn/manager/api/ansible/introspectInventory")
+    mock_ctx.session.check_client_capability.return_value = True
+    mock_ctx.elicit = AsyncMock()
+
+    with pytest.raises(UnexpectedResponse):
+        await server._get_ansible_inventory(99, "mock_token", mock_ctx)
+
+    mock_ctx.elicit.assert_not_called()
+    assert not inventory_route.called
+
+@pytest.mark.asyncio
+async def test_ansible_post_helpers_refused_with_write_tools_disabled(mock_uyuni, mock_ctx, monkeypatch):
+    monkeypatch.setitem(server.CONFIG, "UYUNI_MCP_WRITE_TOOLS_ENABLED", False)
+    from mcp_server_uyuni.errors import APIError
+    _, inventory_route = _mock_inventory_path(mock_uyuni)
+
+    with pytest.raises(APIError):
+        await server._list_ansible_playbooks(5, "mock_token")
+    with pytest.raises(APIError):
+        await server._get_ansible_inventory(6, "mock_token", _says_yes(mock_ctx))
+    assert not inventory_route.called
+
+@pytest.mark.asyncio
+async def test_ansible_tools_registered():
+    tools = {tool.name for tool in await server.mcp.list_tools()}
+
+    # test module runs with write tools enabled, so the POST tools are visible here
+    assert {"list_ansible_control_nodes", "list_ansible_playbooks", "get_ansible_inventory"} <= tools
+
+@pytest.mark.asyncio
+async def test_ansible_tools_annotations():
+    tools = {tool.name: tool for tool in await server.mcp.list_tools()}
+
+    def hints(name):
+        annotations = tools[name].annotations
+        return (annotations.readOnlyHint, annotations.idempotentHint, annotations.destructiveHint)
+
+    assert hints("list_ansible_control_nodes") == (True, True, None)
+    assert hints("list_ansible_playbooks") == (True, True, None)
+    # reading an inventory makes the control node execute it, so it is not marked read-only
+    assert hints("get_ansible_inventory") == (False, None, False)
+
+@pytest.mark.asyncio
+async def test_list_ansible_playbooks_accepts_listed_path_id_and_pages(mock_uyuni):
+    # list_ansible_control_nodes returns path ids as strings; the follow-up tools must take them as given.
+    from fastmcp import Client
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.post(f"{base_url}/rhn/manager/api/login").mock(
+        return_value=Response(200, json={"success": True})
+    )
+    route = mock_uyuni.post(f"{base_url}/rhn/manager/api/ansible/discoverPlaybooks").mock(
+        return_value=Response(200, json={"success": True, "result": {"/etc/ansible/playbooks": {
+            f"play{n}.yml": {"fullpath": f"/etc/ansible/playbooks/play{n}.yml"} for n in range(3)
+        }}})
+    )
+
+    async with Client(server.mcp) as client:
+        result = await client.call_tool("list_ansible_playbooks", {"path_id": "2", "limit": 2})
+        empty = await client.call_tool("list_ansible_playbooks", {"path_id": "2", "offset": 3})
+
+    assert json.loads(route.calls[0].request.content) == {"pathId": 2}
+    assert result.data['path_id'] == "2"
+    assert [item['playbook'] for item in result.data['items']] == ["play0.yml", "play1.yml"]
+    assert result.data['meta']['total_count'] == 3 and result.data['meta']['next_offset'] == 2
+    # nothing on the page: the result still names the path
+    assert empty.data['path_id'] == "2" and empty.data['items'] == []
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approve,executed", [(True, True), (False, False)])
+async def test_get_ansible_inventory_elicits_through_mcp(mock_uyuni, approve, executed):
+    # A real MCP client that supports elicitation: the tool must wait for the answer before the POST.
+    from fastmcp import Client
+    from fastmcp.client.elicitation import ElicitResult
+    mock_uyuni.post(f"{server.CONFIG['UYUNI_SERVER']}/rhn/manager/api/login").mock(
+        return_value=Response(200, json={"success": True})
+    )
+    _, inventory_route = _mock_inventory_path(mock_uyuni)
+    prompts = []
+
+    async def answer(message, response_type, params, context):
+        prompts.append(message)
+        assert not inventory_route.called
+        if approve:
+            return response_type(approve=True)
+        return ElicitResult(action="decline")
+
+    async with Client(server.mcp, elicitation_handler=answer) as client:
+        result = await client.call_tool("get_ansible_inventory", {"path_id": "6", "limit": 1})
+
+    assert len(prompts) == 1 and "as root" in prompts[0]
+    assert inventory_route.called is executed
+    if executed:
+        assert result.data['items'] == [{'host': "alma.example.com", 'groups': ["web"]}]
+        assert result.data['meta']['total_count'] == 2 and result.data['meta']['truncated'] is True
+        assert result.data['groups']['web'] == {'children': [], 'host_count': 2}
+    else:
+        assert result.data['message'] == "Operation cancelled."
+        assert result.data['items'] == [] and result.data['meta']['total_count'] == 0
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_refuses_through_mcp_without_elicitation(mock_uyuni):
+    # A real MCP client that cannot be asked: the tool answers with a refusal and the POST never happens.
+    from fastmcp import Client
+    mock_uyuni.post(f"{server.CONFIG['UYUNI_SERVER']}/rhn/manager/api/login").mock(
+        return_value=Response(200, json={"success": True})
+    )
+    _, inventory_route = _mock_inventory_path(mock_uyuni)
+
+    async with Client(server.mcp) as client:
+        result = await client.call_tool("get_ansible_inventory", {"path_id": "6"})
+
+    assert "cannot ask for a confirmation" in result.data['message']
+    assert result.data['items'] == [] and not inventory_route.called
+
+@pytest.fixture
+def server_log(caplog, monkeypatch):
+    """caplog for the server's logger, which does not propagate to the root logger."""
+    monkeypatch.setattr(server.logger, "propagate", True)
+    return caplog
+
+@pytest.mark.asyncio
+async def test_list_ansible_control_nodes_skips_items_without_id(mock_uyuni, server_log):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/system/listSystemsWithEntitlement").mock(
+        return_value=Response(200, json={"success": True, "result": [{"name": "no-id.example.com"}, {"id": 1001, "name": "cn1.example.com"}]})
+    )
+    paths_route = mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/listAnsiblePaths").mock(
+        return_value=Response(200, json={"success": True, "result": [
+            {"type": "inventory", "server_id": 1001, "path": "/etc/ansible/no-id"},
+            "not-a-path",
+            {"id": 6, "type": "inventory", "server_id": 1001, "path": "/etc/ansible/hosts"},
+        ]})
+    )
+
+    result = await server._list_ansible_control_nodes("mock_token")
+
+    assert result == [{
+        'system_id': "1001",
+        'system_name': "cn1.example.com",
+        'playbook_paths': [],
+        'inventory_paths': [{'path_id': "6", 'path': "/etc/ansible/hosts"}],
+    }]
+    assert paths_route.call_count == 1
+    assert "no-id.example.com" in server_log.text and "/etc/ansible/no-id" in server_log.text and "not-a-path" in server_log.text
+
+@pytest.mark.asyncio
+async def test_list_ansible_control_nodes_path_listing_fails(mock_uyuni):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/system/listSystemsWithEntitlement").mock(
+        return_value=Response(200, json={"success": True, "result": [
+            {"id": 1001, "name": "cn1.example.com"},
+            {"id": 1002, "name": "cn2.example.com"},
+        ]})
+    )
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/listAnsiblePaths").mock(
+        side_effect=[
+            Response(200, json={"success": True, "result": []}),
+            Response(200, json={"success": False, "message": "No such system - sid = 1002"}),
+        ]
+    )
+
+    # A failure on one node reaches the caller, as other API failures do, instead of a partial list.
+    with pytest.raises(UnexpectedResponse, match="No such system"):
+        await server._list_ansible_control_nodes("mock_token")
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("systems,paths,expected,log", [
+    ("not a list", [], [], "Expected a list of control nodes"),
+    ([{"id": 1001, "name": "cn1.example.com"}], {"unexpected": "dict"},
+     [{'system_id': "1001", 'system_name': "cn1.example.com", 'playbook_paths': [], 'inventory_paths': []}],
+     "Expected a list of Ansible paths for control node 1001"),
+])
+async def test_list_ansible_control_nodes_non_list_results(mock_uyuni, server_log, systems, paths, expected, log):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/system/listSystemsWithEntitlement").mock(
+        return_value=Response(200, json={"success": True, "result": systems})
+    )
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/listAnsiblePaths").mock(
+        return_value=Response(200, json={"success": True, "result": paths})
+    )
+
+    assert await server._list_ansible_control_nodes("mock_token") == expected
+    assert log in server_log.text
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_result,expected,log", [
+    (["not", "a", "dict"], [], "Expected a dict of discovered playbooks"),
+    ({"/etc/ansible/playbooks": ["not", "a", "dict"], "/srv/playbooks": {"site.yml": {"fullpath": "/srv/playbooks/site.yml"}}},
+     [{'playbook': "site.yml", 'full_path': "/srv/playbooks/site.yml", 'inventory': ""}], "Unexpected item format in discovered playbooks"),
+    ({"/srv/playbooks": {"site.yml": "not a dict"}},
+     [{'playbook': "site.yml", 'full_path': "", 'inventory': ""}], "Unexpected details for playbook site.yml"),
+])
+async def test_list_ansible_playbooks_unexpected_result(mock_uyuni, server_log, api_result, expected, log):
+    mock_uyuni.post(f"{server.CONFIG['UYUNI_SERVER']}/rhn/manager/api/ansible/discoverPlaybooks").mock(
+        return_value=Response(200, json={"success": True, "result": api_result})
+    )
+
+    assert await server._list_ansible_playbooks(5, "mock_token") == expected
+    assert log in server_log.text
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_unexpected_result(mock_uyuni, mock_ctx, server_log):
+    _, inventory_route = _mock_inventory_path(mock_uyuni)
+    inventory_route.mock(return_value=Response(200, json={"success": True, "result": ["not", "a", "dict"]}))
+
+    result = await server._get_ansible_inventory(6, "mock_token", _says_yes(mock_ctx))
+
+    assert result['groups'] == {} and result['hosts'] == []
+    assert "Nothing was listed" in result['message']
+    assert "Expected a dict" in server_log.text
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_skips_malformed_group(mock_uyuni, mock_ctx, server_log):
+    _, inventory_route = _mock_inventory_path(mock_uyuni)
+    inventory_route.mock(return_value=Response(200, json={"success": True, "result": {
+        "web": ["not", "a", "dict"],
+        "db": {"hosts": ["leap.example.com"]},
+    }}))
+
+    result = await server._get_ansible_inventory(6, "mock_token", _says_yes(mock_ctx))
+
+    assert result['groups'] == {'db': {'children': [], 'host_count': 1}}
+    assert result['hosts'] == [{'host': "leap.example.com", 'groups': ["db"]}]
+    assert "inventory group web" in server_log.text
+
+@pytest.mark.asyncio
+async def test_get_ansible_inventory_lookup_without_server_id(mock_uyuni, mock_ctx):
+    base_url = server.CONFIG["UYUNI_SERVER"]
+    mock_uyuni.get(f"{base_url}/rhn/manager/api/ansible/lookupAnsiblePathById").mock(
+        return_value=Response(200, json={"success": True, "result": {"id": 6, "type": "inventory", "path": "/etc/ansible/hosts"}})
+    )
+    inventory_route = mock_uyuni.post(f"{base_url}/rhn/manager/api/ansible/introspectInventory")
+    mock_ctx.session.check_client_capability.return_value = True
+    mock_ctx.elicit = AsyncMock(return_value=MagicMock(action="decline", data=None))
+
+    result = await server._get_ansible_inventory(6, "mock_token", mock_ctx)
+
+    assert 'system_id' not in result
+    assert "None" not in mock_ctx.elicit.call_args.args[0]
+    assert not inventory_route.called
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool,route_path", [
+    ("list_ansible_playbooks", "discoverPlaybooks"),
+    ("get_ansible_inventory", "introspectInventory"),
+])
+async def test_ansible_post_salt_fault_reaches_caller(mock_uyuni, mock_ctx, tool, route_path):
+    _mock_inventory_path(mock_uyuni)
+    mock_uyuni.post(f"{server.CONFIG['UYUNI_SERVER']}/rhn/manager/api/ansible/{route_path}").mock(
+        return_value=Response(200, json={"success": False, "message": "Salt fault: Minion not responding"})
+    )
+
+    with pytest.raises(UnexpectedResponse, match="Minion not responding"):
+        if tool == "list_ansible_playbooks":
+            await server._list_ansible_playbooks(5, "mock_token")
+        else:
+            await server._get_ansible_inventory(6, "mock_token", _says_yes(mock_ctx))

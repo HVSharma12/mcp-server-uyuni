@@ -46,6 +46,9 @@ It is designed to be run as a container remotely (HTTP) or locally (stdio), offe
 * `list_all_scheduled_actions`: Fetches a list of all scheduled, in-progress, completed, or failed actions.
 * `list_system_groups`: Fetches a list of system groups from the Uyuni server.
 * `list_group_systems`: Lists the systems in a system group.
+* `list_ansible_control_nodes`: Lists Ansible control nodes with their playbook and inventory paths.
+* `list_ansible_playbooks`: Lists the playbooks under a playbook path of a control node (needs `UYUNI_MCP_WRITE_TOOLS_ENABLED=true`).
+* `get_ansible_inventory`: Lists the groups and hosts of an inventory path; the control node runs `ansible-inventory` as root, so it asks first and refuses when the client cannot ask (needs `UYUNI_MCP_WRITE_TOOLS_ENABLED=true`).
 * `schedule_pending_updates_to_system`: Checks for pending updates on a system, schedules all of them to be applied.
 * `schedule_specific_update`: Schedules a specific update (erratum) to be applied to a system.
 * `add_system`: Bootstraps and registers a new system with Uyuni using an activation key.
